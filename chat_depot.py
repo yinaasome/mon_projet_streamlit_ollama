@@ -18,27 +18,33 @@ import bcrypt
 # 🎨 Configuration de la page
 st.set_page_config(page_title="🎓 Analyse Scolaire", layout="wide")
 
-# 🔧 Configuration MongoDB
-@st.cache_resource
-def init_mongodb():
-    try:
-        # Remplacez par votre URI MongoDB (local ou Atlas)
-        client = MongoClient("mongodb://localhost:27017/")
-        db = client.chatbot_scolaire
-        
-        # Test de connexion
-        client.admin.command('ping')
-        return db
-    except Exception as e:
-        st.error(f"Erreur de connexion à MongoDB: {e}")
-        return None
+# 🔧 Configuration pour le déploiement
+# Variables d'environnement pour les services externes
+OLLAMA_SERVER_URL = os.getenv("OLLAMA_SERVER_URL", "http://localhost:11434")
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+USE_EXTERNAL_SERVICES = os.getenv("USE_EXTERNAL_SERVICES", "false").lower() == "true"
 
 # 🔐 Classe pour gérer l'authentification
 class AuthManager:
-    def __init__(self, db):
+    def __init__(self, db=None):
         self.db = db
-        self.users = db.users
-        
+        if db:
+            self.users = db.users
+        else:
+            # Mode local si MongoDB n'est pas disponible
+            if 'users_db' not in st.session_state:
+                st.session_state.users_db = {
+                    "admin": {
+                        "username": "admin",
+                        "password": bcrypt.hashpw("admin123".encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+                        "email": "admin@example.com",
+                        "role": "Admin",
+                        "created_at": datetime.datetime.now(),
+                        "last_login": None,
+                        "is_active": True
+                    }
+                }
+    
     def hash_password(self, password: str) -> str:
         """Hache le mot de passe avec bcrypt"""
         return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
@@ -49,74 +55,97 @@ class AuthManager:
     
     def create_user(self, username: str, password: str, email: str = "", role: str = "Enseignant") -> bool:
         """Crée un nouvel utilisateur"""
-        # Vérifier si l'utilisateur existe déjà
-        if self.users.find_one({"username": username}):
-            return False
-        
-        # Créer l'utilisateur
-        user_data = {
-            "username": username,
-            "password": self.hash_password(password),
-            "email": email,
-            "role": role,
-            "created_at": datetime.datetime.now(),
-            "last_login": None,
-            "is_active": True
-        }
-        
-        self.users.insert_one(user_data)
-        return True
+        if self.db:
+            # Vérifier si l'utilisateur existe déjà
+            if self.users.find_one({"username": username}):
+                return False
+            
+            # Créer l'utilisateur
+            user_data = {
+                "username": username,
+                "password": self.hash_password(password),
+                "email": email,
+                "role": role,
+                "created_at": datetime.datetime.now(),
+                "last_login": None,
+                "is_active": True
+            }
+            
+            self.users.insert_one(user_data)
+            return True
+        else:
+            # Mode local
+            if username in st.session_state.users_db:
+                return False
+            
+            st.session_state.users_db[username] = {
+                "username": username,
+                "password": self.hash_password(password),
+                "email": email,
+                "role": role,
+                "created_at": datetime.datetime.now(),
+                "last_login": None,
+                "is_active": True
+            }
+            return True
     
     def authenticate_user(self, username: str, password: str) -> Optional[Dict]:
         """Authentifie un utilisateur"""
-        user = self.users.find_one({"username": username, "is_active": True})
-        
-        if user and self.verify_password(password, user["password"]):
-            # Mettre à jour la dernière connexion
-            self.users.update_one(
-                {"_id": user["_id"]},
-                {"$set": {"last_login": datetime.datetime.now()}}
-            )
+        if self.db:
+            user = self.users.find_one({"username": username, "is_active": True})
             
-            # Retourner les données utilisateur (sans le mot de passe)
-            user_data = {
-                "user_id": str(user["_id"]),
-                "username": user["username"],
-                "email": user["email"],
-                "role": user["role"],
-                "created_at": user["created_at"],
-                "last_login": datetime.datetime.now()
-            }
-            return user_data
-        
-        return None
-    
-    def get_user_by_id(self, user_id: str) -> Optional[Dict]:
-        """Récupère un utilisateur par son ID"""
-        try:
-            user = self.users.find_one({"_id": ObjectId(user_id)})
-            if user:
-                return {
+            if user and self.verify_password(password, user["password"]):
+                # Mettre à jour la dernière connexion
+                self.users.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"last_login": datetime.datetime.now()}}
+                )
+                
+                # Retourner les données utilisateur (sans le mot de passe)
+                user_data = {
                     "user_id": str(user["_id"]),
                     "username": user["username"],
                     "email": user["email"],
                     "role": user["role"],
                     "created_at": user["created_at"],
-                    "last_login": user.get("last_login")
+                    "last_login": datetime.datetime.now()
                 }
-        except:
-            pass
+                return user_data
+        else:
+            # Mode local
+            user = st.session_state.users_db.get(username)
+            if user and user["is_active"] and self.verify_password(password, user["password"]):
+                user["last_login"] = datetime.datetime.now()
+                return {
+                    "user_id": hashlib.sha256(username.encode()).hexdigest(),
+                    "username": user["username"],
+                    "email": user["email"],
+                    "role": user["role"],
+                    "created_at": user["created_at"],
+                    "last_login": user["last_login"]
+                }
+        
         return None
 
-# 🗃️ Classe pour gérer la mémoire et l'historique (mise à jour)
+# 🗃️ Classe pour gérer la mémoire et l'historique (compatible local et MongoDB)
 class ChatbotMemory:
-    def __init__(self, db):
+    def __init__(self, db=None):
         self.db = db
-        self.conversations = db.conversations
-        self.user_profiles = db.user_profiles
-        self.user_context = db.user_context
-        self.chat_sessions = db.chat_sessions
-        
+        if db:
+            self.conversations = db.conversations
+            self.user_profiles = db.user_profiles
+            self.user_context = db.user_context
+            self.chat_sessions = db.chat_sessions
+        else:
+            # Initialisation des structures en mémoire si pas de DB
+            if 'memory' not in st.session_state:
+                st.session_state.memory = {
+                    'conversations': [],
+                    'user_profiles': {},
+                    'user_context': {},
+                    'chat_sessions': []
+                }
+    
     def create_new_chat_session(self, user_id: str) -> str:
         """Crée une nouvelle session de chat"""
         session_data = {
@@ -126,20 +155,39 @@ class ChatbotMemory:
             "title": f"Chat du {datetime.datetime.now().strftime('%d/%m/%Y à %H:%M')}"
         }
         
-        result = self.chat_sessions.insert_one(session_data)
-        return str(result.inserted_id)
+        if self.db:
+            result = self.chat_sessions.insert_one(session_data)
+            return str(result.inserted_id)
+        else:
+            session_id = f"session_{len(st.session_state.memory['chat_sessions'])}"
+            session_data['_id'] = session_id
+            st.session_state.memory['chat_sessions'].append(session_data)
+            return session_id
     
     def get_user_chat_sessions(self, user_id: str, limit: int = 20) -> List[Dict]:
         """Récupère les sessions de chat d'un utilisateur"""
-        return list(self.chat_sessions.find(
-            {"user_id": user_id}
-        ).sort("created_at", -1).limit(limit))
+        if self.db:
+            return list(self.chat_sessions.find(
+                {"user_id": user_id}
+            ).sort("created_at", -1).limit(limit))
+        else:
+            return sorted(
+                [s for s in st.session_state.memory['chat_sessions'] if s['user_id'] == user_id],
+                key=lambda x: x['created_at'],
+                reverse=True
+            )[:limit]
     
     def get_session_conversations(self, session_id: str) -> List[Dict]:
         """Récupère les conversations d'une session"""
-        return list(self.conversations.find(
-            {"session_id": session_id}
-        ).sort("timestamp", 1))
+        if self.db:
+            return list(self.conversations.find(
+                {"session_id": session_id}
+            ).sort("timestamp", 1))
+        else:
+            return sorted(
+                [c for c in st.session_state.memory['conversations'] if c.get('session_id') == session_id],
+                key=lambda x: x['timestamp']
+            )
     
     def save_conversation(self, user_id: str, session_id: str, question: str, response: str, metadata: Dict = None):
         """Sauvegarde une conversation avec la session"""
@@ -151,38 +199,46 @@ class ChatbotMemory:
             "timestamp": datetime.datetime.now(),
             "metadata": metadata or {}
         }
-        return self.conversations.insert_one(conversation_data)
+        
+        if self.db:
+            return self.conversations.insert_one(conversation_data)
+        else:
+            st.session_state.memory['conversations'].append(conversation_data)
+            return True
     
     def get_conversation_history(self, user_id: str, limit: int = 50):
         """Récupère l'historique global des conversations"""
-        return list(self.conversations.find(
-            {"user_id": user_id}
-        ).sort("timestamp", -1).limit(limit))
+        if self.db:
+            return list(self.conversations.find(
+                {"user_id": user_id}
+            ).sort("timestamp", -1).limit(limit))
+        else:
+            return sorted(
+                [c for c in st.session_state.memory['conversations'] if c['user_id'] == user_id],
+                key=lambda x: x['timestamp'],
+                reverse=True
+            )[:limit]
     
     def get_user_context(self, user_id: str):
         """Récupère le contexte utilisateur"""
-        return self.user_context.find_one({"user_id": user_id}) or {}
+        if self.db:
+            return self.user_context.find_one({"user_id": user_id}) or {}
+        else:
+            return st.session_state.memory['user_context'].get(user_id, {})
     
     def update_user_context(self, user_id: str, context_data: Dict):
         """Met à jour le contexte utilisateur"""
-        self.user_context.update_one(
-            {"user_id": user_id},
-            {"$set": {**context_data, "last_updated": datetime.datetime.now()}},
-            upsert=True
-        )
-    
-    def save_user_profile(self, user_id: str, profile_data: Dict):
-        """Sauvegarde le profil utilisateur"""
-        profile_data["last_updated"] = datetime.datetime.now()
-        self.user_profiles.update_one(
-            {"user_id": user_id},
-            {"$set": profile_data},
-            upsert=True
-        )
-    
-    def get_user_profile(self, user_id: str):
-        """Récupère le profil utilisateur"""
-        return self.user_profiles.find_one({"user_id": user_id}) or {}
+        if self.db:
+            self.user_context.update_one(
+                {"user_id": user_id},
+                {"$set": {**context_data, "last_updated": datetime.datetime.now()}},
+                upsert=True
+            )
+        else:
+            current = st.session_state.memory['user_context'].get(user_id, {})
+            current.update(context_data)
+            current['last_updated'] = datetime.datetime.now()
+            st.session_state.memory['user_context'][user_id] = current
     
     def add_recent_entity(self, user_id: str, entity_type: str, entity_id: str, entity_name: str):
         """Ajoute une entité récemment consultée"""
@@ -209,10 +265,16 @@ class ChatbotMemory:
     
     def update_session_title(self, session_id: str, title: str):
         """Met à jour le titre d'une session"""
-        self.chat_sessions.update_one(
-            {"_id": ObjectId(session_id)},
-            {"$set": {"title": title}}
-        )
+        if self.db:
+            self.chat_sessions.update_one(
+                {"_id": ObjectId(session_id)},
+                {"$set": {"title": title}}
+            )
+        else:
+            for session in st.session_state.memory['chat_sessions']:
+                if session['_id'] == session_id:
+                    session['title'] = title
+                    break
 
 # 🔐 Interface de connexion
 def show_login_page(auth_manager):
@@ -268,32 +330,33 @@ def show_login_page(auth_manager):
                     st.error("Veuillez saisir tous les champs obligatoires")
 
 # 🗃️ Chargement des données
-@st.cache_data(ttl=5184000)
+@st.cache_data(ttl=3600)
 def load_data():
     try:
+        # Pour Streamlit Cloud, utilisez une URL ou un chemin relatif
         df = pd.read_csv("donnees_nettoyees.csv", sep=';', encoding='ISO-8859-1', low_memory=False)
         return df
-    except FileNotFoundError:
-        st.error("Fichier 'donnees_nettoyees.csv' non trouvé. Veuillez vérifier le chemin.")
-        return pd.DataFrame()
-# 🔗 URL du serveur Ollama (à adapter si distant ou avec ngrok)
-OLLAMA_SERVER_URL = "http://localhost:11434"
+    except Exception as e:
+        st.error(f"Erreur lors du chargement des données: {e}")
+        # Retourne un DataFrame vide avec les colonnes attendues
+        return pd.DataFrame(columns=[
+            'id_eleve', 'identifiant_unique_eleve', 'id_classe', 'code_classe', 
+            'nom_classe', 'nom_ecole', 'code_ecole', 'moyenne_t1', 'moyenne_t2', 
+            'moyenne_t3', 'rang_t1', 'rang_t2', 'rang_t3'
+        ])
 
-# Test de disponibilité du modèle
-try:
-    test_response = requests.post(
-        f"{OLLAMA_SERVER_URL}/api/generate",
-        json={"model": "gemma:2b", "prompt": "Bonjour", "stream": False}
-    )
-    if not test_response.ok:
-        st.warning(f"⚠️ Le modèle Ollama 'gemma:2b' n'a pas répondu correctement : {test_response.status_code}")
-except Exception as e:
-    st.error(f"Erreur de connexion au serveur Ollama : {e}")
-
-# 🔧 Initialisation du modèle
-@st.cache_resource
+# 🤖 Initialisation du modèle LLM
 def init_llm():
-    return ChatOllama(model="gemma:2b", temperature=0.7)
+    try:
+        return ChatOllama(
+            base_url=OLLAMA_SERVER_URL,
+            model="gemma:2b",
+            temperature=0.7,
+            timeout=60
+        )
+    except Exception as e:
+        st.warning(f"Erreur d'initialisation du modèle LLM: {e}")
+        return None
 
 # 📋 Template prompt amélioré avec mémoire
 def get_enhanced_prompt_template():
@@ -367,6 +430,9 @@ def extraire_filtre(question, valeurs_connues):
 
 # 🔁 Fonction principale améliorée
 def get_response_from_dataframe(question, df, memory, user_id, session_id):
+    if df.empty:
+        return "Aucune donnée disponible pour l'analyse."
+    
     question_lower = question.lower()
     
     # 🧠 Détection des références contextuelles
@@ -455,6 +521,9 @@ def get_response_from_dataframe(question, df, memory, user_id, session_id):
             
             # Générer la réponse
             llm = init_llm()
+            if llm is None:
+                return "Le service d'analyse n'est pas disponible pour le moment."
+            
             prompt = prompt_template.format(
                 question=question,
                 donnees=donnees_texte,
@@ -462,22 +531,38 @@ def get_response_from_dataframe(question, df, memory, user_id, session_id):
                 contexte_utilisateur=contexte_text
             )
             
-            resultat = llm.invoke(prompt)
-            response = resultat.content if hasattr(resultat, 'content') else str(resultat)
-            
-            # Sauvegarder la conversation avec métadonnées enrichies
-            metadata = {
-                'type': 'eleve',
-                'eleve_id': ident,
-                'ecole': ligne.get('nom_ecole', ''),
-                'classe': ligne.get('nom_classe', ''),
-                'sujet': 'general'
-            }
-            memory.save_conversation(user_id, session_id, question, response, metadata)
-            
-            return response
+            try:
+                resultat = llm.invoke(prompt)
+                response = resultat.content if hasattr(resultat, 'content') else str(resultat)
+                
+                # Sauvegarder la conversation avec métadonnées enrichies
+                metadata = {
+                    'type': 'eleve',
+                    'eleve_id': ident,
+                    'ecole': ligne.get('nom_ecole', ''),
+                    'classe': ligne.get('nom_classe', ''),
+                    'sujet': 'general'
+                }
+                memory.save_conversation(user_id, session_id, question, response, metadata)
+                
+                return response
+            except Exception as e:
+                st.error(f"Erreur lors de la génération de la réponse: {e}")
+                return "Une erreur est survenue lors de l'analyse des données."
     
     return "Aucun filtre détecté dans la question. Veuillez spécifier un élève, une classe ou une école."
+
+# Initialisation MongoDB
+def init_mongodb():
+    try:
+        if USE_EXTERNAL_SERVICES and MONGODB_URI:
+            client = MongoClient(MONGODB_URI)
+            client.admin.command('ping')  # Test de connexion
+            db = client.chatbot_scolaire
+            return db
+    except Exception as e:
+        st.warning(f"Connexion MongoDB échouée, utilisation du mode local: {e}")
+    return None
 
 # 🎨 Interface Streamlit améliorée
 def main():
@@ -490,10 +575,6 @@ def main():
     
     # Initialisation MongoDB
     db = init_mongodb()
-    if db is None:
-        st.error("Impossible de se connecter à la base de données.")
-        return
-    
     auth_manager = AuthManager(db)
     
     # Vérifier l'authentification
@@ -555,8 +636,8 @@ def main():
         sessions = memory.get_user_chat_sessions(user_id, 10)
         
         for session in sessions:
-            session_id = str(session['_id'])
-            session_title = session.get('title', f"Chat {session['created_at'].strftime('%d/%m')}")
+            session_id = str(session.get('_id', session.get('id', '')))
+            session_title = session.get('title', f"Chat {session.get('created_at', datetime.datetime.now()).strftime('%d/%m')}")
             
             # Bouton pour charger la session
             if st.button(f"📄 {session_title}", key=f"session_{session_id}"):
