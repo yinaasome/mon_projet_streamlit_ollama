@@ -352,10 +352,10 @@ def init_llm():
             base_url=OLLAMA_SERVER_URL,
             model="gemma:2b",
             temperature=0.7,
-            timeout=60
+            timeout=30
         )
     except Exception as e:
-        st.warning(f"Erreur d'initialisation du modèle LLM: {e}")
+        st.warning(f"LLM non disponible: {e}")
         return None
 
 # 📋 Template prompt amélioré avec mémoire
