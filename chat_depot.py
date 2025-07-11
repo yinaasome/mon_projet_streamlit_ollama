@@ -20,7 +20,7 @@ st.set_page_config(page_title="🎓 Analyse Scolaire", layout="wide")
 
 # 🔧 Configuration pour le déploiement
 # Variables d'environnement pour les services externes
-OLLAMA_SERVER_URL = os.getenv("OLLAMA_SERVER_URL", "http://localhost:11434")
+OLLAMA_SERVER_URL = os.getenv("OLLAMA_SERVER_URL", "http://host.docker.internal:11434")
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
 USE_EXTERNAL_SERVICES = os.getenv("USE_EXTERNAL_SERVICES", "false").lower() == "true"
 
