@@ -1,0 +1,7 @@
+streamlit
+pandas
+requests
+langchain
+langchain-ollama
+pymongo
+bcrypt
