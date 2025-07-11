@@ -5,3 +5,4 @@ langchain
 langchain-ollama
 pymongo
 bcrypt
+langchain-ollama>=0.1.0
